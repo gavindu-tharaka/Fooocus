@@ -76,6 +76,16 @@ prepare_environment()
 build_launcher()
 args = ini_args()
 
+# For this CUDA-optimized branch, force Fooocus to use the first CUDA device
+# exclusively and ignore any additional GPUs.  This helps avoid unexpected
+# device selection on multi‑GPU systems.
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+# On systems with more than 4 GB of VRAM we disable low‑VRAM optimizations to
+# maximise performance.  The detection logic is handled in
+# ldm_patched.modules.model_management, so here we only set a flag for clarity.
+os.environ['FOOOCUS_DISABLE_LOW_VRAM'] = '1'
+
 if args.gpu_device_id is not None:
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_device_id)
     print("Set device to:", args.gpu_device_id)
