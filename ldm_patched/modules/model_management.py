@@ -5,6 +5,14 @@ import ldm_patched.modules.utils
 import torch
 import sys
 
+# NOTE:
+# This branch `cuda-rtx3060` is intended for systems with an NVIDIA GPU (e.g. RTX 3060)
+# and forces the application to run exclusively on CUDA. Alternative backends such
+# as DirectML, Intel XPU, or Apple MPS have been intentionally disabled. If a CUDA
+# device is not present, the application will exit with an informative error.
+# Additionally, low‑VRAM mode is only enabled on GPUs with 4 GB or less VRAM.
+# A clear banner is printed during initialization to indicate these constraints.
+
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
     NO_VRAM = 1     #Very low vram: enable all the options to save vram
@@ -14,6 +22,7 @@ class VRAMState(Enum):
     SHARED = 5      #No dedicated vram: memory shared between CPU and GPU but models still need to be moved between both.
 
 class CPUState(Enum):
+    # The only supported device state is GPU when running on CUDA.
     GPU = 0
     CPU = 1
     MPS = 2
@@ -23,71 +32,55 @@ vram_state = VRAMState.NORMAL_VRAM
 set_vram_to = VRAMState.NORMAL_VRAM
 cpu_state = CPUState.GPU
 
+# Track total dedicated VRAM (in bytes).  Will be computed later.
 total_vram = 0
 
+# Low‑VRAM support flag; will be disabled on GPUs with more than 4 GB.
 lowvram_available = True
-xpu_available = False
 
+# Always run deterministic algorithms if requested.
 if args.pytorch_deterministic:
     print("Using deterministic algorithms for pytorch")
     torch.use_deterministic_algorithms(True, warn_only=True)
 
+# Force all alternative backends to be disabled.  This branch does not support
+# DirectML, Intel XPU or Apple MPS.  If the user provides flags requesting
+# these backends, they will be ignored.
 directml_enabled = False
-if args.directml is not None:
-    import torch_directml
-    directml_enabled = True
-    device_index = args.directml
-    if device_index < 0:
-        directml_device = torch_directml.device()
-    else:
-        directml_device = torch_directml.device(device_index)
-    print("Using directml with device:", torch_directml.device_name(device_index))
-    # torch_directml.disable_tiled_resources(True)
-    lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
-
-try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        xpu_available = True
-except:
-    pass
-
-try:
-    if torch.backends.mps.is_available():
-        cpu_state = CPUState.MPS
-        import torch.mps
-except:
-    pass
+xpu_available = False
 
 if args.always_cpu:
+    # Honour explicit CPU request by using CPU threads.  Note that this branch
+    # will still attempt to use CUDA unless --always-cpu is set.
     if args.always_cpu > 0:
         torch.set_num_threads(args.always_cpu)
-    print(f"Running on {torch.get_num_threads()} CPU threads")
+    print(f"Running on {torch.get_num_threads()} CPU threads (forced CPU)")
     cpu_state = CPUState.CPU
 
 def is_intel_xpu():
-    global cpu_state
-    global xpu_available
-    if cpu_state == CPUState.GPU:
-        if xpu_available:
-            return True
+    """Legacy helper retained for compatibility.  Always returns False in this branch."""
     return False
 
 def get_torch_device():
-    global directml_enabled
-    global cpu_state
-    if directml_enabled:
-        global directml_device
-        return directml_device
-    if cpu_state == CPUState.MPS:
-        return torch.device("mps")
+    """
+    Return the torch.device that should be used for model execution.
+
+    This branch forces the use of CUDA.  If CUDA is not available, print a
+    descriptive error and exit.  The CPU fallback (and other backends) are
+    intentionally unsupported in order to ensure maximum performance on an
+    NVIDIA GPU such as the RTX 3060.
+    """
+    # If the user explicitly requested CPU via --always-cpu, honour it.
     if cpu_state == CPUState.CPU:
         return torch.device("cpu")
-    else:
-        if is_intel_xpu():
-            return torch.device("xpu")
-        else:
-            return torch.device(torch.cuda.current_device())
+    # Check CUDA availability.
+    if not torch.cuda.is_available():
+        print(
+            "[Error] CUDA device not available. This branch requires an NVIDIA GPU with CUDA support."
+        )
+        sys.exit(1)
+    # Use the current CUDA device.
+    return torch.device("cuda")
 
 def get_total_memory(dev=None, torch_total_too=False):
     global directml_enabled
@@ -121,9 +114,18 @@ def get_total_memory(dev=None, torch_total_too=False):
 total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
 total_ram = psutil.virtual_memory().total / (1024 * 1024)
 print("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
+
+# Print an informative banner indicating the runtime configuration.
+print("[Fooocus] Running with RTX 3060 + CUDA (cuda-rtx3060 branch)")
+
+# Determine whether to enable low VRAM mode.  Only enable it if the GPU has
+# 4 GB or less of VRAM and the user did not override via --always-normal-vram or
+# --always-cpu.
 if not args.always_normal_vram and not args.always_cpu:
     if lowvram_available and total_vram <= 4096:
-        print("Trying to enable lowvram mode because your GPU seems to have 4GB or less. If you don't want this use: --always-normal-vram")
+        print(
+            "Enabling low VRAM mode because your GPU has 4 GB or less. Use --always-normal-vram to disable this."
+        )
         set_vram_to = VRAMState.LOW_VRAM
 
 try:
